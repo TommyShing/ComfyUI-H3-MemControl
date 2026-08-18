@@ -16,10 +16,40 @@ from .manager import format_bytes, log_memory, registry
 logger = logging.getLogger("H3MemControl")
 
 
+def _wrap_vae_lifecycle(vae: Any) -> Any:
+    if vae is None or getattr(vae, "_memcontrol_lifecycle_wrapped", False):
+        return vae
+
+    def managed_call(method_name: str):
+        original = getattr(vae, method_name)
+
+        def wrapper(*args, **kwargs):
+            try:
+                return original(*args, **kwargs)
+            finally:
+                try:
+                    import comfy.model_management as model_management
+
+                    patcher = getattr(vae, "patcher", None)
+                    if patcher is not None:
+                        model_management.unload_model_and_clones(patcher)
+                        logger.info("[MemControl] VAE %s released from VRAM", method_name)
+                except Exception as exc:
+                    logger.warning("[MemControl] VAE %s release failed: %s", method_name, exc)
+
+        return wrapper
+
+    vae.decode = managed_call("decode")
+    if hasattr(vae, "encode"):
+        vae.encode = managed_call("encode")
+    vae._memcontrol_lifecycle_wrapped = True
+    return vae
+
+
 def _cache_vae(value: Any | None) -> Any | None:
     if value is None:
         return None
-    return registry.cache_vae(value)
+    return _wrap_vae_lifecycle(registry.cache_vae(value))
 
 
 def _make_prefetch_free_forward(
@@ -305,8 +335,9 @@ class H3MemControlVAECache(io.ComfyNode):
             display_name="H3 MemControl VAE Cache",
             category="h3/memcontrol",
             description=(
-                "Keeps one VAE instance per file path for the Comfy process lifetime. "
-                "The cached VAE is outside Comfy output cache and is not evicted by clean_unused()."
+                "Keeps one VAE instance per file path for the Comfy process lifetime and releases "
+                "it from VRAM after each encode/decode use. The cached VAE is outside Comfy output "
+                "cache and is not evicted by clean_unused()."
             ),
             search_aliases=["h3 vae cache", "h3 mem control vae cache"],
             inputs=[

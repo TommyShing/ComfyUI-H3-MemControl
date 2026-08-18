@@ -116,6 +116,17 @@ class NodeSchemaTests(unittest.TestCase):
         schema = nodes.H3MemControlSetup.GET_SCHEMA()
         self.assertEqual(len(schema.inputs), 4)
 
+    def test_vae_lifecycle_wrapper(self):
+        class FakeVAE:
+            patcher = None
+
+            def decode(self):
+                return "decoded"
+
+        vae = nodes._wrap_vae_lifecycle(FakeVAE())
+        self.assertEqual(vae.decode(), "decoded")
+        self.assertTrue(vae._memcontrol_lifecycle_wrapped)
+
     def test_qwen_patch_applied_to_managed_layers_parent(self):
         root = FakeQwenRoot()
         manager = MemControlManager()

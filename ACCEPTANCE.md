@@ -19,7 +19,7 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 | 3 | qwen released after text encoding | Cleanup node releases qwen resident blocks and VRAM drops | Code path present, runtime pending |
 | 4 | H3 no prefetch scan | No first pass over `blocks`; each real block access starts at count=1 | Unit verified, runtime pending |
 | 5 | H3 released after sampling | Cleanup node releases H3 resident blocks and VRAM drops | Code path present, runtime pending |
-| 6 | VAE cache | One instance per file path for process lifetime; VAE only in VRAM during decode | Cache code present, runtime pending |
+| 6 | VAE cache | One instance per file path for process lifetime; VAE only in VRAM during encode/decode and released after use | Code path present, runtime pending |
 | 7 | No ComfyUI changes | Git diff and repo contain no edits under ComfyUI path | Pass |
 | 8 | 8GB workflow completes | qwen completes, H3 completes, VAE decode completes without OOM | Pending real workflow test |
 
@@ -30,11 +30,12 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 3. Verify on the real workflow that qwen is released by the cleanup node after text encoding and before H3 sampling.
 4. Verify on the real workflow that H3 no longer pre-scans blocks and only loads one managed block for real forward access.
 5. If the real run still OOMs, use the `evict_after_*` memory logs to separate "weights were not released" from "activations/other models still occupy VRAM".
-6. Only after those checks pass, treat the architecture as accepted and run the full VAE decode path.
+6. Verify cached VAEs are released from VRAM after encode/decode and stay cached in RAM.
+7. Only after those checks pass, treat the architecture as accepted and run the full VAE decode path.
 
 ## Current Evidence
 
-- Unit tests: 10 passed.
+- Unit tests: 11 passed.
 - Compile check: passed.
 - H3 `_forward` patch compiles against current Comfy source.
 - Qwen `Llama2_.forward` patch compiles against current Comfy source.
