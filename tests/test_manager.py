@@ -84,9 +84,10 @@ class CudaLifecycleTests(unittest.TestCase):
         manager.set_container_limit("layers", module_bytes(model.layers._modules["0"]))
 
         for idx in range(4):
-            model.layers[idx]
+            layer = model.layers[idx]
             self.assertEqual(len(manager.resident), 1)
             self.assertIn(("layers", idx), manager.resident)
+            self.assertEqual(layer.linear.weight.device.type, "cpu")
 
         manager.cleanup_root("clip")
         self.assertEqual(len(manager.resident), 0)

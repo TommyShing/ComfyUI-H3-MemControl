@@ -75,32 +75,6 @@ def _has_meta_params(module: nn.Module) -> bool:
     return False
 
 
-def _backup_param_refs(module: nn.Module) -> None:
-    if getattr(module, "_memcontrol_param_refs", None) is not None:
-        return
-    refs = {name: p.data for name, p in module.named_parameters(recurse=True)}
-    module._memcontrol_param_refs = refs
-    buffers = {name: b.data for name, b in module.named_buffers(recurse=True)}
-    module._memcontrol_buffer_refs = buffers
-
-
-def _restore_param_refs(module: nn.Module) -> None:
-    refs = getattr(module, "_memcontrol_param_refs", None)
-    if refs is not None:
-        params = dict(module.named_parameters(recurse=True))
-        for name, orig in refs.items():
-            if name in params:
-                params[name].data = orig
-        delattr(module, "_memcontrol_param_refs")
-    buffers = getattr(module, "_memcontrol_buffer_refs", None)
-    if buffers is not None:
-        current_buffers = dict(module.named_buffers(recurse=True))
-        for name, orig in buffers.items():
-            if name in current_buffers:
-                current_buffers[name].data = orig
-        delattr(module, "_memcontrol_buffer_refs")
-
-
 def _clear_comfy_module_state(module: nn.Module) -> None:
     try:
         import comfy.model_prefetch
@@ -299,7 +273,6 @@ class MemControlManager:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             _clear_comfy_module_state(block)
-            _restore_param_refs(block)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -366,12 +339,10 @@ class MemControlManager:
         except Exception as exc:
             logger.warning("[MemControl] budget check failed: %s", exc)
 
-        _backup_param_refs(block)
-        block.to(compute_device)
         self.resident[key] = (self._get_swl_by_path(container_path), idx, root_name, size)
         self.last_used[key] = time.time()
         logger.info(
-            "[MemControl] load %s[%d] size=%s resident=%d",
+            "[MemControl] activate %s[%d] size=%s active=%d",
             container_path,
             idx,
             format_bytes(size),

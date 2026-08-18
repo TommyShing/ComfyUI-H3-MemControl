@@ -11,7 +11,7 @@ Test version of H3 memory control nodes. This package does not modify ComfyUI of
 | `H3MemControlVAECache` | `vae: VAE`, `audio_vae: VAE?` | same objects | Keep one VAE instance per file path and release it from VRAM after encode/decode use |
 | `H3MemControlDebug` | `model: MODEL?` | `status: STRING` | Return resident block, budget, cache, VRAM/RAM log state |
 
-This is an experimental test build. It monitors block access and memory state, and schedules qwen and H3 by loading accessed layers/blocks onto the configured compute device and evicting under a byte budget. MemControl disables Comfy's prefetch scanning for both managed qwen layers and H3 blocks so they are only loaded on real access. Auto cleanup releases qwen after text encoding and H3 after sampling. qwen is always managed by MemControl; there is no fallback switch. Cached VAEs are released from VRAM after each encode/decode use and remain cached in RAM.
+This is an experimental test build. MemControl keeps qwen and H3 layers/blocks in the RAM buffer and lets Comfy cast/dequantize the active operator transiently into VRAM. MemControl disables Comfy's prefetch scanning for both managed qwen layers and H3 blocks so they are only used on real access. Auto cleanup releases qwen after text encoding and H3 after sampling. qwen is always managed by MemControl; there is no fallback switch. Cached VAEs are released from VRAM after each encode/decode use and remain cached in RAM.
 
 ## Workflow
 

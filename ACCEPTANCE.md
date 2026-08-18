@@ -5,9 +5,9 @@ Acceptance and current plan for the MemControl test build. ComfyUI files are nev
 ## Lifecycle Under Test
 
 ```text
-qwen: SSD/内存 -> 显存一层 -> 文字编码完释放
-H3: SSD/内存 -> 显存一层 -> 生成完释放
-VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
+qwen: SSD/内存 buffer -> 当前层由 Comfy cast/dequant 临时进显存 -> 用完释放
+H3: SSD/内存 buffer -> 当前块由 Comfy cast/dequant 临时进显存 -> 用完释放
+VAE: 常驻内存 -> 编码/解码时进显存 -> 用后回内存
 ```
 
 ## Test Table
@@ -34,7 +34,7 @@ H3 forward is patched: no prefetch list scan; block access goes through MemContr
 VAE cache keeps one instance per path in RAM and releases VRAM after encode/decode
 ```
 
-Current pending risk: qwen still OOMs around layer 13 while MemControl is active. The first hypothesis is Comfy cast/prefetch state surviving after evict; the shared evict path now clears it. If that is not enough, the next step is to replace whole-layer `block.to(cuda)` with Comfy vbar/buffer-compatible loading.
+Current pending risk: qwen still OOMs around layer 13 while MemControl is active. The root cause was whole-layer `block.to(cuda)`: it put the quantized layer and its dequantized copy in VRAM at once. MemControl now keeps layers/blocks in the RAM buffer and lets Comfy cast/dequant each operator transiently into VRAM.
 
 ## Current Plan
 
