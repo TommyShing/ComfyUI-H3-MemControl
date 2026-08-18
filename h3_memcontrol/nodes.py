@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
+import re
+import textwrap
+import types
 from typing import Any
 
 from comfy_api.latest import ComfyExtension, io
@@ -18,6 +22,75 @@ def _cache_vae(value: Any | None) -> Any | None:
     return registry.cache_vae(value)
 
 
+def _make_prefetch_free_forward(original):
+    try:
+        source = textwrap.dedent(inspect.getsource(original))
+    except Exception as exc:
+        logger.warning("[MemControl] H3 prefetch patch source read failed: %s", exc)
+        return None
+
+    prefetch_source = (
+        "prefetch_queue = comfy.model_prefetch.make_prefetch_queue("
+        "list(self.blocks), device, transformer_options)"
+    )
+    if prefetch_source not in source:
+        logger.warning("[MemControl] H3 prefetch patch skipped: expected prefetch line not found")
+        return None
+
+    source = source.replace(prefetch_source, "prefetch_queue = None")
+    loop_match = re.search(r"^(\s*)for i, block in enumerate\(self\.blocks\):\s*$", source, re.MULTILINE)
+    if loop_match is None:
+        logger.warning("[MemControl] H3 prefetch patch skipped: expected block loop not found")
+        return None
+
+    indent = loop_match.group(1)
+    loop_replacement = (
+        f"{indent}for i in range(len(self.blocks)):\n"
+        f"{indent}    block = self.blocks[i]\n"
+    )
+    source = source[:loop_match.start()] + loop_replacement + source[loop_match.end():]
+
+    namespace = dict(original.__globals__)
+    try:
+        exec(
+            compile(source, inspect.getsourcefile(original) or "<H3MemControl>", "exec"),
+            namespace,
+        )
+    except Exception as exc:
+        logger.warning("[MemControl] H3 prefetch patch compile failed: %s", exc)
+        return None
+    return namespace.get(original.__name__)
+
+
+def _patch_h3_prefetch(model) -> None:
+    if model is None:
+        return
+    patcher = model
+    existing = getattr(patcher, "_memcontrol_prefetch_forward", None)
+    if existing is not None:
+        try:
+            if patcher.get_model_object("diffusion_model._forward") == existing:
+                return
+        except Exception:
+            pass
+
+    root = getattr(patcher, "model", None)
+    diffusion = getattr(root, "diffusion_model", None)
+    original = getattr(type(diffusion), "_forward", None) if diffusion is not None else None
+    if original is None:
+        return
+
+    new_forward = _make_prefetch_free_forward(original)
+    if new_forward is None:
+        logger.warning("[MemControl] H3 prefetch patch skipped")
+        return
+
+    bound = types.MethodType(new_forward, diffusion)
+    patcher._memcontrol_prefetch_forward = bound
+    patcher.add_object_patch("diffusion_model._forward", bound)
+    logger.info("[MemControl] patched H3 _forward: prefetch queue disabled, block loop uses MemControl indexing")
+
+
 def _install_roots(manager, model, clip, manage_qwen: bool = False):
     seen: set[int] = set()
     if model is not None:
@@ -25,6 +98,7 @@ def _install_roots(manager, model, clip, manage_qwen: bool = False):
             model_device = getattr(model, "load_device", None)
             manager.install_on_root(model.model, "model", seen=seen, root_device=model_device)
             manager.patch_load_list(model, "model")
+            _patch_h3_prefetch(model)
         except Exception as exc:
             logger.warning("[MemControl] model container scan failed: %s", exc)
     if clip is not None and manage_qwen:
@@ -47,6 +121,7 @@ def _install_roots(manager, model, clip, manage_qwen: bool = False):
         except Exception as exc:
             logger.warning("[MemControl] clip patcher filter failed: %s", exc)
     elif clip is not None:
+        manager.native_clip = True
         logger.info("[MemControl] qwen managed by Comfy native dynamic VRAM (manage_qwen=False)")
 
 
@@ -124,6 +199,7 @@ class H3MemControlCleanup(io.ComfyNode):
             category="h3/memcontrol",
             description=(
                 "Restores MemControl-wrapped block containers and releases buffer/LoRA state. "
+                "Auto cleanup also unloads native qwen/VAE models before managed H3 work starts. "
                 "It does not clear user IO such as prompt, seed, images, or video previews."
             ),
             search_aliases=["h3 memcontrol cleanup", "h3 mem control cleanup"],

@@ -251,6 +251,7 @@ class MemControlManager:
         self.container_limits: dict[str, int] = {}
         self.model_accessed = False
         self.clip_accessed = False
+        self.native_clip = False
         self.created_at = time.time()
 
     def install_on_root(
@@ -351,10 +352,11 @@ class MemControlManager:
         swl, idx, root_name = resident_entry
         try:
             block = swl._modules[str(idx)]
-            _restore_param_refs(block)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-                gc.collect()
+            _restore_param_refs(block)
+            gc.collect()
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             logger.info(
                 "[MemControl] evict root=%s %s[%d]",
@@ -499,6 +501,20 @@ class MemControlManager:
             self.buffer_pool.release()
         log_memory(f"cleanup_{root_name}")
 
+    def _unload_native_models(self) -> None:
+        try:
+            import comfy.model_management as model_management
+
+            model_management.unload_all_models()
+            logger.info("[MemControl] unloaded native Comfy models before managed model work")
+        except Exception as exc:
+            logger.warning("[MemControl] failed to unload native Comfy models: %s", exc)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def cleanup_auto(self) -> None:
         log_memory("cleanup_auto")
         if self.model_accessed:
@@ -508,7 +524,12 @@ class MemControlManager:
             logger.info("[MemControl] cleanup_auto clip_accessed=True -> cleanup clip")
             self.cleanup_root("clip", release_buffer=False)
         if not self.model_accessed and not self.clip_accessed:
-            logger.info("[MemControl] cleanup_auto no block accessed yet -> skip")
+            if self.native_clip:
+                logger.info("[MemControl] cleanup_auto no managed block accessed yet; unloading native qwen/VAE")
+                self._unload_native_models()
+                log_memory("cleanup_auto_native")
+            else:
+                logger.info("[MemControl] cleanup_auto no block accessed yet -> skip")
 
     def cleanup(self) -> None:
         for key in list(self.resident):

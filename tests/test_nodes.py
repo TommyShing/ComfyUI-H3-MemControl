@@ -17,6 +17,14 @@ except Exception as exc:
     NODE_IMPORT_ERROR = exc
 
 
+def h3_prefetch_like(self):
+    prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)
+    for i, block in enumerate(self.blocks):
+        block()
+    if prefetch_queue is not None:
+        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
+
+
 @unittest.skipUnless(nodes is not None, f"ComfyUI comfy_api unavailable: {NODE_IMPORT_ERROR}")
 class NodeSchemaTests(unittest.TestCase):
     def test_extension_registers_nodes(self):
@@ -40,6 +48,13 @@ class NodeSchemaTests(unittest.TestCase):
     def test_debug_returns_string(self):
         result = nodes.H3MemControlDebug.execute()
         self.assertIsInstance(result[0], str)
+
+    def test_h3_prefetch_forward_patch(self):
+        new_forward = nodes._make_prefetch_free_forward(h3_prefetch_like)
+        self.assertIsNotNone(new_forward)
+        names = new_forward.__code__.co_names
+        self.assertNotIn("enumerate", names)
+        self.assertIn("range", names)
 
 
 if __name__ == "__main__":
