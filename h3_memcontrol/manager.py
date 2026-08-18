@@ -203,6 +203,10 @@ class MemControlModuleList(nn.ModuleList):
             self._note_access(idx)
         return super().__getitem__(idx)
 
+    def __iter__(self):
+        for idx in range(len(self)):
+            yield self[idx]
+
 
 class MemControlBufferPool:
     """Placeholder for the shared transfer/cast buffer lifecycle."""
@@ -261,7 +265,7 @@ class MemControlManager:
             swl = MemControlModuleList(orig, self, name, child_path, root_device)
             setattr(parent, name, swl)
             self.installations.append((weakref.ref(parent), name, orig, swl, root_name))
-            for block in swl:
+            for block in orig:
                 for module in block.modules():
                     self.managed_module_ids.add(id(module))
             logger.info(
