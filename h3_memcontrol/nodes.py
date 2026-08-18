@@ -131,11 +131,13 @@ class H3MemControlCleanup(io.ComfyNode):
     @classmethod
     def execute(cls, passthrough, stage="auto") -> io.NodeOutput:
         log_memory(f"cleanup_start_{stage}")
-        if stage in ("auto", "full", "after_sampling"):
+        if stage == "auto":
+            registry.cleanup_auto()
+        elif stage == "after_sampling":
             registry.cleanup_root("model", release_buffer=True)
-        if stage in ("auto", "full", "after_te"):
+        elif stage == "after_te":
             registry.cleanup_root("clip", release_buffer=False)
-        if stage == "full":
+        elif stage == "full":
             registry.cleanup_all()
         logger.info("[MemControl] cleanup stage=%s complete", stage)
         log_memory(f"cleanup_done_{stage}")

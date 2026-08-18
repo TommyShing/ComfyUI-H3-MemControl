@@ -244,6 +244,8 @@ class MemControlManager:
         self.resident: dict[tuple[str, int], tuple[MemControlModuleList, int, str]] = {}
         self.last_used: dict[tuple[str, int], float] = {}
         self.managed_module_ids: set[int] = set()
+        self.model_accessed = False
+        self.clip_accessed = False
         self.created_at = time.time()
 
     def install_on_root(
@@ -336,6 +338,11 @@ class MemControlManager:
         compute_device,
     ) -> bool:
         key = (container_path, idx)
+        root_name = self._root_for_path(container_path)
+        if root_name == "model":
+            self.model_accessed = True
+        elif root_name == "clip":
+            self.clip_accessed = True
         if key in self.resident:
             self.last_used[key] = time.time()
             return True
@@ -441,6 +448,17 @@ class MemControlManager:
             self.buffer_pool.release()
         log_memory(f"cleanup_{root_name}")
 
+    def cleanup_auto(self) -> None:
+        log_memory("cleanup_auto")
+        if self.model_accessed:
+            logger.info("[MemControl] cleanup_auto model_accessed=True -> cleanup model")
+            self.cleanup_root("model", release_buffer=True)
+        if self.clip_accessed:
+            logger.info("[MemControl] cleanup_auto clip_accessed=True -> cleanup clip")
+            self.cleanup_root("clip", release_buffer=False)
+        if not self.model_accessed and not self.clip_accessed:
+            logger.info("[MemControl] cleanup_auto no block accessed yet -> skip")
+
     def cleanup(self) -> None:
         for key in list(self.resident):
             self._evict(key)
@@ -485,6 +503,10 @@ class _Registry:
     def cleanup_root(self, root_name: str, release_buffer: bool = False) -> None:
         for manager in list(self.managers.values()):
             manager.cleanup_root(root_name, release_buffer=release_buffer)
+
+    def cleanup_auto(self) -> None:
+        for manager in list(self.managers.values()):
+            manager.cleanup_auto()
 
     def cleanup_all(self) -> None:
         for manager in list(self.managers.values()):
