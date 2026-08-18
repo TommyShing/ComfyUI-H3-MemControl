@@ -23,6 +23,19 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 | 7 | No ComfyUI changes | Git diff and repo contain no edits under ComfyUI path | Pass |
 | 8 | 8GB workflow completes | qwen completes, H3 completes, VAE decode completes without OOM | Pending real workflow test |
 
+## Comfy Flow Map
+
+```text
+Comfy loads model/clip/vae
+H3MemControlSetup registers qwen layers + H3 blocks
+Comfy _load_list is filtered so managed layers/blocks are not loaded by Comfy
+qwen forward is patched: no prefetch list scan; layer access goes through MemControl
+H3 forward is patched: no prefetch list scan; block access goes through MemControl
+VAE cache keeps one instance per path in RAM and releases VRAM after encode/decode
+```
+
+Current pending risk: qwen still OOMs around layer 13 while MemControl is active. The first hypothesis is Comfy cast/prefetch state surviving after evict; the shared evict path now clears it. If that is not enough, the next step is to replace whole-layer `block.to(cuda)` with Comfy vbar/buffer-compatible loading.
+
 ## Current Plan
 
 1. Keep qwen and H3 owned by MemControl, with Comfy excluded from loading/prefetching their layers; no fallback switch.
