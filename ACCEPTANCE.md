@@ -25,7 +25,7 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 
 ## Current Evidence
 
-- Unit tests: 9 passed.
+- Unit tests: 10 passed.
 - Compile check: passed.
 - H3 `_forward` patch compiles against current Comfy source.
 - Qwen `Llama2_.forward` patch compiles against current Comfy source.

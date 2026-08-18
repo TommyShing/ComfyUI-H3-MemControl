@@ -5,7 +5,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from h3_memcontrol.manager import MemControlManager, registry
+from h3_memcontrol.manager import MemControlManager, module_bytes, registry
 
 
 class Block(nn.Module):
@@ -49,6 +49,36 @@ class ManagerTests(unittest.TestCase):
         cached = registry.cache_vae(vae)
         self.assertIs(cached, vae)
         self.assertIs(registry.get_vae(vae), vae)
+
+
+class CudaLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(128, 128)
+
+
+class CudaQwenLike(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([CudaLayer() for _ in range(4)])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class CudaLifecycleTests(unittest.TestCase):
+    def test_layer_limit_keeps_only_latest_resident_and_cleanup_returns_cpu(self):
+        model = CudaQwenLike()
+        manager = MemControlManager(headroom_bytes=0)
+        manager.install_on_root(model, "clip", root_device=torch.device("cuda"))
+        manager.set_container_limit("layers", module_bytes(model.layers._modules["0"]))
+
+        for idx in range(4):
+            model.layers[idx]
+            self.assertEqual(len(manager.resident), 1)
+            self.assertIn(("layers", idx), manager.resident)
+
+        manager.cleanup_root("clip")
+        self.assertEqual(len(manager.resident), 0)
+        self.assertEqual(model.layers[0].linear.weight.device.type, "cpu")
 
 
 if __name__ == "__main__":
