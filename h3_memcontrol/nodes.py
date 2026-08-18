@@ -18,7 +18,7 @@ def _cache_vae(value: Any | None) -> Any | None:
     return registry.cache_vae(value)
 
 
-def _install_roots(manager, model, clip):
+def _install_roots(manager, model, clip, manage_qwen: bool = False):
     seen: set[int] = set()
     if model is not None:
         try:
@@ -27,7 +27,7 @@ def _install_roots(manager, model, clip):
             manager.patch_load_list(model, "model")
         except Exception as exc:
             logger.warning("[MemControl] model container scan failed: %s", exc)
-    if clip is not None:
+    if clip is not None and manage_qwen:
         patcher = getattr(clip, "patcher", None)
         clip_device = getattr(patcher, "load_device", None)
         roots = []
@@ -46,6 +46,8 @@ def _install_roots(manager, model, clip):
             manager.patch_load_list(patcher, "clip")
         except Exception as exc:
             logger.warning("[MemControl] clip patcher filter failed: %s", exc)
+    elif clip is not None:
+        logger.info("[MemControl] qwen managed by Comfy native dynamic VRAM (manage_qwen=False)")
 
 
 class H3MemControlSetup(io.ComfyNode):
@@ -67,6 +69,11 @@ class H3MemControlSetup(io.ComfyNode):
                 io.Clip.Input("clip", optional=True),
                 io.Vae.Input("vae", optional=True),
                 io.Vae.Input("audio_vae", optional=True),
+                io.Boolean.Input(
+                    "manage_qwen",
+                    default=False,
+                    tooltip="Experimental: let H3MemControl schedule qwen blocks. Default off; qwen uses Comfy native dynamic VRAM until vbar-based qwen handling is stable.",
+                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -77,10 +84,10 @@ class H3MemControlSetup(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, clip=None, vae=None, audio_vae=None) -> io.NodeOutput:
+    def execute(cls, model, clip=None, vae=None, audio_vae=None, manage_qwen=False) -> io.NodeOutput:
         manager = registry.create_manager()
         log_memory("setup_start")
-        _install_roots(manager, model, clip)
+        _install_roots(manager, model, clip, manage_qwen=manage_qwen)
         vae = _cache_vae(vae)
         audio_vae = _cache_vae(audio_vae)
         logger.info(
