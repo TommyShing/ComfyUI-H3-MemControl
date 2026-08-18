@@ -98,6 +98,10 @@ class H3MemControlSetup(io.ComfyNode):
                 format_bytes(stat["size_bytes"]),
                 format_bytes(stat["max_block_bytes"]),
             )
+            if stat["root"] == "clip" and "transformer.model.layers" in stat["container"]:
+                manager.set_container_limit(stat["container"], stat["max_block_bytes"])
+            if stat["root"] == "model" and stat["container"].endswith("diffusion_model.blocks"):
+                manager.set_container_limit(stat["container"], stat["max_block_bytes"] * 2)
         log_memory("setup_done")
         return io.NodeOutput(model, clip, vae, audio_vae)
 

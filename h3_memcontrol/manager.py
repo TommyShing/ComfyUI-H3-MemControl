@@ -248,6 +248,7 @@ class MemControlManager:
         self.resident: dict[tuple[str, int], tuple[MemControlModuleList, int, str]] = {}
         self.last_used: dict[tuple[str, int], float] = {}
         self.managed_module_ids: set[int] = set()
+        self.container_limits: dict[str, int] = {}
         self.model_accessed = False
         self.clip_accessed = False
         self.created_at = time.time()
@@ -286,11 +287,21 @@ class MemControlManager:
         def filtered_load_list(*args, **kwargs):
             entries = original(*args, **kwargs)
             result = []
+            skipped = 0
             for entry in entries:
                 module = entry[-2] if entry else None
                 if module is not None and id(module) in self.managed_module_ids:
+                    skipped += 1
                     continue
                 result.append(entry)
+            if skipped:
+                logger.info(
+                    "[MemControl] _load_list root=%s total=%d managed_skipped=%d kept=%d",
+                    root_name,
+                    len(entries),
+                    skipped,
+                    len(result),
+                )
             return result
 
         filtered_load_list._memcontrol_patched = True
@@ -302,9 +313,29 @@ class MemControlManager:
     def record_access(self, container_path: str, idx: int, size: int, resident: bool) -> None:
         self.last_access[(container_path, idx)] = (time.time(), size, resident)
 
+    def set_container_limit(self, container_path: str, limit_bytes: int) -> None:
+        self.container_limits[container_path] = int(limit_bytes)
+        logger.info(
+            "[MemControl] container limit %s=%s",
+            container_path,
+            format_bytes(limit_bytes),
+        )
+
     def _resident_bytes(self) -> int:
         total = 0
         for key in self.resident:
+            try:
+                swl, idx, _ = self.resident[key]
+                total += module_bytes(swl._modules[str(idx)])
+            except Exception:
+                pass
+        return total
+
+    def _container_resident_bytes(self, container_path: str) -> int:
+        total = 0
+        for key in self.resident:
+            if key[0] != container_path:
+                continue
             try:
                 swl, idx, _ = self.resident[key]
                 total += module_bytes(swl._modules[str(idx)])
@@ -322,6 +353,7 @@ class MemControlManager:
             block = swl._modules[str(idx)]
             _restore_param_refs(block)
             if torch.cuda.is_available():
+                torch.cuda.synchronize()
                 gc.collect()
                 torch.cuda.empty_cache()
             logger.info(
@@ -356,6 +388,21 @@ class MemControlManager:
             return False
         if not torch.cuda.is_available():
             return False
+
+        limit = self.container_limits.get(container_path)
+        if limit is not None:
+            while self._container_resident_bytes(container_path) + size > limit:
+                victim_key = next(
+                    (
+                        key
+                        for key in sorted(self.last_used, key=self.last_used.get)
+                        if key[0] == container_path and key in self.resident
+                    ),
+                    None,
+                )
+                if victim_key is None:
+                    break
+                self._evict(victim_key)
 
         try:
             free_bytes, _ = torch.cuda.mem_get_info(compute_device)
