@@ -1,0 +1,2 @@
+# ComfyUI provides torch, torchvision, comfy_api, and psutil in its runtime.
+# This test build has no extra pip dependencies.

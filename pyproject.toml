@@ -1,0 +1,12 @@
+[project]
+name = "comfyui-h3-memcontrol"
+description = "Test version of H3 MemControl custom nodes for ComfyUI."
+version = "0.1.0"
+license = { text = "Apache-2.0" }
+dependencies = []
+requires-python = ">=3.10"
+
+[tool.comfy]
+PublisherId = "local"
+DisplayName = "ComfyUI H3 MemControl"
+Icon = ""

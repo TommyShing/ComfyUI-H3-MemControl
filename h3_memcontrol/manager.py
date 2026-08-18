@@ -1,0 +1,554 @@
+"""MemControl manager and monitoring helpers.
+
+This is a test/monitoring implementation. It does not modify ComfyUI official
+files, and it intentionally avoids aggressive model unloading until the block
+access/memory logs show the real runtime behavior.
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+import time
+import uuid
+import weakref
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+logger = logging.getLogger("H3MemControl")
+
+CONTAINER_NAMES = (
+    "blocks",
+    "transformer_blocks",
+    "double_blocks",
+    "single_blocks",
+    "input_blocks",
+    "output_blocks",
+    "middle_block",
+    "layers",
+    "double_stream_layers",
+    "single_stream_layers",
+    "block",
+)
+
+
+def format_bytes(value: float | int) -> str:
+    value = float(value)
+    if value >= 1024 ** 3:
+        return f"{value / 1024 ** 3:.2f}GB"
+    if value >= 1024 ** 2:
+        return f"{value / 1024 ** 2:.1f}MB"
+    if value >= 1024:
+        return f"{value / 1024:.0f}KB"
+    return f"{value:.0f}B"
+
+
+def log_memory(label: str) -> None:
+    try:
+        import psutil  # type: ignore
+
+        vm = psutil.virtual_memory()
+        ram_used = vm.used
+        ram_available = vm.available
+    except Exception:
+        ram_used = ram_available = -1
+
+    vram_used = vram_free = -1
+    try:
+        if torch.cuda.is_available():
+            vram_free, vram_total = torch.cuda.mem_get_info()
+            vram_used = vram_total - vram_free
+    except Exception:
+        pass
+
+    logger.info(
+        "[MemControl] memory %s | VRAM used=%s free=%s | RAM used=%s available=%s",
+        label,
+        format_bytes(vram_used),
+        format_bytes(vram_free),
+        format_bytes(ram_used),
+        format_bytes(ram_available),
+    )
+
+
+def module_bytes(module: nn.Module) -> int:
+    total = 0
+    for p in module.parameters():
+        total += p.numel() * p.element_size()
+    for b in module.buffers():
+        total += b.numel() * b.element_size()
+    return total
+
+
+def is_resident(module: nn.Module, device: torch.device | None = None) -> bool:
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    params = list(module.parameters(recurse=True))
+    if not params:
+        return False
+    return all(p.device == device for p in params)
+
+
+def _has_meta_params(module: nn.Module) -> bool:
+    for p in module.parameters(recurse=True):
+        if p.device.type == "meta":
+            return True
+    return False
+
+
+def _backup_param_refs(module: nn.Module) -> None:
+    if getattr(module, "_memcontrol_param_refs", None) is not None:
+        return
+    refs = {name: p.data for name, p in module.named_parameters(recurse=True)}
+    module._memcontrol_param_refs = refs
+    buffers = {name: b.data for name, b in module.named_buffers(recurse=True)}
+    module._memcontrol_buffer_refs = buffers
+
+
+def _restore_param_refs(module: nn.Module) -> None:
+    refs = getattr(module, "_memcontrol_param_refs", None)
+    if refs is not None:
+        params = dict(module.named_parameters(recurse=True))
+        for name, orig in refs.items():
+            if name in params:
+                params[name].data = orig
+        delattr(module, "_memcontrol_param_refs")
+    buffers = getattr(module, "_memcontrol_buffer_refs", None)
+    if buffers is not None:
+        current_buffers = dict(module.named_buffers(recurse=True))
+        for name, orig in buffers.items():
+            if name in current_buffers:
+                current_buffers[name].data = orig
+        delattr(module, "_memcontrol_buffer_refs")
+
+
+def find_block_containers(
+    root: nn.Module,
+    depth: int = 0,
+    seen: set[int] | None = None,
+    path: str = "",
+):
+    if seen is None:
+        seen = set()
+    if depth > 12:
+        return
+    for name, child in root.named_children():
+        child_path = f"{path}.{name}" if path else name
+        if isinstance(child, (nn.ModuleList, list)) and len(child) > 0 and hasattr(child[0], "forward"):
+            if id(child) not in seen:
+                seen.add(id(child))
+                yield name, child, root, child_path
+        elif isinstance(child, nn.Module):
+            yield from find_block_containers(child, depth + 1, seen, child_path)
+
+
+def _vae_path(vae: Any) -> str | None:
+    try:
+        init = getattr(vae.patcher, "cached_patcher_init", None)
+        if init and len(init) >= 2 and init[1] and isinstance(init[1][0], str):
+            return init[1][0]
+    except Exception:
+        pass
+    return None
+
+
+class MemControlModuleList(nn.ModuleList):
+    """ModuleList replacement that logs block access without moving weights yet."""
+
+    def __init__(self, modules, manager, container_name: str, container_path: str, root_device=None):
+        super().__init__(modules)
+        self.memcontrol_manager_ref = weakref.ref(manager)
+        self.container_name = container_name
+        self.container_path = container_path
+        self.root_device = root_device
+        self._access_counts: dict[int, int] = {}
+        self._last_resident: dict[int, bool] = {}
+
+    def _note_access(self, idx: int) -> None:
+        manager = self.memcontrol_manager_ref()
+        if manager is None or idx < 0 or idx >= len(self):
+            return
+        count = self._access_counts.get(idx, 0) + 1
+        self._access_counts[idx] = count
+        try:
+            block = self._modules[str(idx)]
+            size = module_bytes(block)
+        except Exception:
+            size = 0
+        resident = False
+        try:
+            resident = manager.ensure_block(self.container_path, idx, block, size, self.root_device)
+        except Exception as exc:
+            logger.warning("[MemControl] ensure_block failed %s[%d]: %s", self.container_path, idx, exc)
+
+        manager.record_access(self.container_path, idx, size, resident)
+
+        prev = self._last_resident.get(idx)
+        should_log = count <= 3 or count % 50 == 0 or prev != resident
+        if should_log:
+            logger.info(
+                "[MemControl] access %s[%d] count=%d size=%s resident=%s",
+                self.container_path,
+                idx,
+                count,
+                format_bytes(size),
+                resident,
+            )
+        self._last_resident[idx] = resident
+
+    def __getitem__(self, idx):
+        if isinstance(idx, int):
+            self._note_access(idx)
+        return super().__getitem__(idx)
+
+
+class MemControlBufferPool:
+    """Placeholder for the shared transfer/cast buffer lifecycle."""
+
+    def __init__(self):
+        self.created = False
+        self.allocated_bytes = 0
+        self.max_bytes = 0
+
+    def reserve(self, size_bytes: int) -> None:
+        self.created = True
+        self.allocated_bytes = size_bytes
+        self.max_bytes = max(self.max_bytes, size_bytes)
+        logger.info(
+            "[MemControl] buffer reserve size=%s max=%s",
+            format_bytes(size_bytes),
+            format_bytes(self.max_bytes),
+        )
+
+    def release(self) -> None:
+        if self.allocated_bytes or self.created:
+            logger.info(
+                "[MemControl] buffer release size=%s max=%s",
+                format_bytes(self.allocated_bytes),
+                format_bytes(self.max_bytes),
+            )
+        self.created = False
+        self.allocated_bytes = 0
+
+
+class MemControlManager:
+    def __init__(self, headroom_bytes: int = 768 * 1024 ** 2):
+        self.manager_id = uuid.uuid4().hex[:12]
+        self.headroom_bytes = headroom_bytes
+        self.installations: list[tuple[weakref.ReferenceType, str, nn.ModuleList, MemControlModuleList, str]] = []
+        self.patcher_filters: list[tuple[Any, Any, str]] = []
+        self.buffer_pool = MemControlBufferPool()
+        self.last_access: dict[tuple[str, int], tuple[float, int, bool]] = {}
+        self.resident: dict[tuple[str, int], tuple[MemControlModuleList, int, str]] = {}
+        self.last_used: dict[tuple[str, int], float] = {}
+        self.managed_module_ids: set[int] = set()
+        self.created_at = time.time()
+
+    def install_on_root(
+        self,
+        root: nn.Module,
+        root_name: str,
+        seen: set[int] | None = None,
+        root_device=None,
+    ) -> None:
+        for name, orig, parent, child_path in find_block_containers(root, seen=seen):
+            if isinstance(orig, MemControlModuleList):
+                continue
+            swl = MemControlModuleList(orig, self, name, child_path, root_device)
+            setattr(parent, name, swl)
+            self.installations.append((weakref.ref(parent), name, orig, swl, root_name))
+            for block in swl:
+                for module in block.modules():
+                    self.managed_module_ids.add(id(module))
+            logger.info(
+                "[MemControl] install root=%s container=%s blocks=%d device=%s",
+                root_name,
+                child_path,
+                len(swl),
+                root_device,
+            )
+
+    def patch_load_list(self, patcher: Any, root_name: str) -> None:
+        if patcher is None or not hasattr(patcher, "_load_list"):
+            return
+        original = getattr(patcher, "_load_list")
+        if getattr(original, "_memcontrol_patched", False):
+            return
+
+        def filtered_load_list(*args, **kwargs):
+            entries = original(*args, **kwargs)
+            result = []
+            for entry in entries:
+                module = entry[-2] if entry else None
+                if module is not None and id(module) in self.managed_module_ids:
+                    continue
+                result.append(entry)
+            return result
+
+        filtered_load_list._memcontrol_patched = True
+        filtered_load_list._memcontrol_original = original
+        patcher._load_list = filtered_load_list
+        self.patcher_filters.append((patcher, original, root_name))
+        logger.info("[MemControl] patched _load_list root=%s", root_name)
+
+    def record_access(self, container_path: str, idx: int, size: int, resident: bool) -> None:
+        self.last_access[(container_path, idx)] = (time.time(), size, resident)
+
+    def _resident_bytes(self) -> int:
+        total = 0
+        for key in self.resident:
+            try:
+                swl, idx, _ = self.resident[key]
+                total += module_bytes(swl._modules[str(idx)])
+            except Exception:
+                pass
+        return total
+
+    def _evict(self, key: tuple[str, int]) -> None:
+        resident_entry = self.resident.pop(key, None)
+        self.last_used.pop(key, None)
+        if resident_entry is None:
+            return
+        swl, idx, root_name = resident_entry
+        try:
+            block = swl._modules[str(idx)]
+            _restore_param_refs(block)
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+            logger.info(
+                "[MemControl] evict root=%s %s[%d]",
+                root_name,
+                swl.container_path,
+                idx,
+            )
+        except Exception as exc:
+            logger.warning("[MemControl] evict failed %s[%d]: %s", swl.container_path, idx, exc)
+
+    def ensure_block(
+        self,
+        container_path: str,
+        idx: int,
+        block: nn.Module,
+        size: int,
+        compute_device,
+    ) -> bool:
+        key = (container_path, idx)
+        if key in self.resident:
+            self.last_used[key] = time.time()
+            return True
+        if compute_device is None or getattr(compute_device, "type", "cpu") == "cpu":
+            return False
+        if _has_meta_params(block):
+            return False
+        if not torch.cuda.is_available():
+            return False
+
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(compute_device)
+            budget = max(0, free_bytes - self.headroom_bytes)
+            needed = size - (budget - self._resident_bytes())
+            if needed > 0:
+                for victim_key in sorted(self.last_used, key=self.last_used.get):
+                    if self.resident.get(victim_key) is None:
+                        continue
+                    self._evict(victim_key)
+                    if self._resident_bytes() + size <= budget:
+                        break
+        except Exception as exc:
+            logger.warning("[MemControl] budget check failed: %s", exc)
+
+        _backup_param_refs(block)
+        block.to(compute_device)
+        self.resident[key] = (self._get_swl_by_path(container_path), idx, self._root_for_path(container_path))
+        self.last_used[key] = time.time()
+        logger.info(
+            "[MemControl] load %s[%d] size=%s resident=%d",
+            container_path,
+            idx,
+            format_bytes(size),
+            len(self.resident),
+        )
+        return True
+
+    def _get_swl_by_path(self, container_path: str) -> MemControlModuleList | None:
+        for parent_ref, name, orig, swl, root_name in self.installations:
+            if swl.container_path == container_path:
+                return swl
+        return None
+
+    def _root_for_path(self, container_path: str) -> str:
+        for parent_ref, name, orig, swl, root_name in self.installations:
+            if swl.container_path == container_path:
+                return root_name
+        return "unknown"
+
+    def container_stats(self) -> list[dict[str, Any]]:
+        stats = []
+        for parent_ref, name, orig, swl, root_name in self.installations:
+            total = len(swl)
+            sizes = []
+            for i in range(total):
+                try:
+                    sizes.append(module_bytes(swl._modules[str(i)]))
+                except Exception:
+                    sizes.append(0)
+            stats.append(
+                {
+                    "root": root_name,
+                    "container": swl.container_path,
+                    "blocks": total,
+                    "size_bytes": sum(sizes),
+                    "max_block_bytes": max(sizes, default=0),
+                    "access_counts": dict(swl._access_counts),
+                }
+            )
+        return stats
+
+    def _release_root_resident(self, root_name: str) -> None:
+        for key in [k for k, (_, _, r) in self.resident.items() if r == root_name]:
+            self._evict(key)
+
+    def cleanup_root(self, root_name: str, release_buffer: bool = False) -> None:
+        remaining = []
+        for parent_ref, name, orig, swl, install_root in self.installations:
+            if install_root == root_name:
+                self._release_root_resident(root_name)
+                parent = parent_ref()
+                if parent is not None and getattr(parent, name, None) is swl:
+                    setattr(parent, name, orig)
+                logger.info(
+                    "[MemControl] cleanup root=%s restore container=%s",
+                    root_name,
+                    swl.container_path,
+                )
+            else:
+                remaining.append((parent_ref, name, orig, swl, install_root))
+        self.installations = remaining
+
+        kept_filters = []
+        for patcher, original, filter_root in self.patcher_filters:
+            if filter_root == root_name and getattr(patcher, "_load_list", None) is not None:
+                patcher._load_list = original
+                logger.info("[MemControl] restore _load_list root=%s", root_name)
+            else:
+                kept_filters.append((patcher, original, filter_root))
+        self.patcher_filters = kept_filters
+
+        if release_buffer:
+            self.buffer_pool.release()
+        log_memory(f"cleanup_{root_name}")
+
+    def cleanup(self) -> None:
+        for key in list(self.resident):
+            self._evict(key)
+        self.resident.clear()
+        self.last_used.clear()
+        for parent_ref, name, orig, swl, root_name in self.installations:
+            parent = parent_ref()
+            if parent is not None and getattr(parent, name, None) is swl:
+                setattr(parent, name, orig)
+            logger.info(
+                "[MemControl] cleanup restore root=%s container=%s",
+                root_name,
+                swl.container_path,
+            )
+        self.installations.clear()
+        for patcher, original, root_name in self.patcher_filters:
+            try:
+                patcher._load_list = original
+            except Exception:
+                pass
+        self.patcher_filters.clear()
+        self.last_access.clear()
+        self.buffer_pool.release()
+        log_memory("cleanup")
+
+
+class _Registry:
+    def __init__(self):
+        self.managers: dict[str, MemControlManager] = {}
+        self.vae_cache: dict[str, Any] = {}
+        self.vae_order: list[str] = []
+
+    def create_manager(self) -> MemControlManager:
+        manager = MemControlManager()
+        self.managers[manager.manager_id] = manager
+        logger.info("[MemControl] create manager id=%s", manager.manager_id)
+        return manager
+
+    def get_manager(self, manager_id: str) -> MemControlManager | None:
+        return self.managers.get(manager_id)
+
+    def cleanup_root(self, root_name: str, release_buffer: bool = False) -> None:
+        for manager in list(self.managers.values()):
+            manager.cleanup_root(root_name, release_buffer=release_buffer)
+
+    def cleanup_all(self) -> None:
+        for manager in list(self.managers.values()):
+            manager.cleanup()
+        self.managers.clear()
+        log_memory("cleanup_all")
+
+    def vae_cache_key(self, vae: Any) -> str:
+        path = _vae_path(vae)
+        if path:
+            return f"path:{path}"
+        return f"id:{id(vae)}"
+
+    def cache_vae(self, vae: Any) -> Any:
+        key = self.vae_cache_key(vae)
+        existing = self.vae_cache.get(key)
+        if existing is not None:
+            logger.info("[MemControl] VAE cache hit key=%s", key)
+            return existing
+        self.vae_cache[key] = vae
+        self.vae_order.append(key)
+        logger.info("[MemControl] VAE cache store key=%s entries=%d", key, len(self.vae_cache))
+        return vae
+
+    def get_vae(self, vae: Any) -> Any | None:
+        return self.vae_cache.get(self.vae_cache_key(vae))
+
+    def status_text(self) -> str:
+        vram_used = vram_free = ram_used = ram_available = -1
+        try:
+            import psutil  # type: ignore
+
+            vm = psutil.virtual_memory()
+            ram_used = vm.used
+            ram_available = vm.available
+        except Exception:
+            pass
+        try:
+            if torch.cuda.is_available():
+                vram_free, vram_total = torch.cuda.mem_get_info()
+                vram_used = vram_total - vram_free
+        except Exception:
+            pass
+
+        lines = [
+            f"managers={len(self.managers)}",
+            f"vae_cache_entries={len(self.vae_cache)}",
+            f"vae_cache_order={self.vae_order[-8:]}",
+            f"VRAM used={format_bytes(vram_used)} free={format_bytes(vram_free)}",
+            f"RAM used={format_bytes(ram_used)} available={format_bytes(ram_available)}",
+        ]
+        for manager in self.managers.values():
+            resident_entries = len(manager.resident)
+            lines.append(
+                f"manager={manager.manager_id} resident_blocks={resident_entries} "
+                f"resident_bytes={format_bytes(manager._resident_bytes())} headroom={format_bytes(manager.headroom_bytes)}"
+            )
+            for stat in manager.container_stats():
+                lines.append(
+                    f"container={stat['container']} blocks={stat['blocks']} "
+                    f"size={format_bytes(stat['size_bytes'])} max_block={format_bytes(stat['max_block_bytes'])} "
+                    f"accesses={sum(stat['access_counts'].values())}"
+                )
+        return "\n".join(lines)
+
+
+registry = _Registry()
