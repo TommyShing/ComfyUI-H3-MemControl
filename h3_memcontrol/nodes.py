@@ -22,31 +22,47 @@ def _cache_vae(value: Any | None) -> Any | None:
     return registry.cache_vae(value)
 
 
-def _make_prefetch_free_forward(original):
+def _make_prefetch_free_forward(
+    original,
+    container="blocks",
+    item="block",
+    prefetch_source=None,
+):
     try:
         source = textwrap.dedent(inspect.getsource(original))
     except Exception as exc:
-        logger.warning("[MemControl] H3 prefetch patch source read failed: %s", exc)
+        logger.warning("[MemControl] prefetch patch source read failed: %s", exc)
         return None
 
-    prefetch_source = (
-        "prefetch_queue = comfy.model_prefetch.make_prefetch_queue("
-        "list(self.blocks), device, transformer_options)"
-    )
+    if prefetch_source is None:
+        prefetch_source = (
+            "prefetch_queue = comfy.model_prefetch.make_prefetch_queue("
+            f"list(self.{container}), device, transformer_options)"
+        )
     if prefetch_source not in source:
-        logger.warning("[MemControl] H3 prefetch patch skipped: expected prefetch line not found")
+        logger.warning(
+            "[MemControl] prefetch patch skipped: expected prefetch line not found for %s",
+            container,
+        )
         return None
 
     source = source.replace(prefetch_source, "prefetch_queue = None")
-    loop_match = re.search(r"^(\s*)for i, block in enumerate\(self\.blocks\):\s*$", source, re.MULTILINE)
+    loop_pattern = re.compile(
+        rf"^(\s*)for i, {item} in enumerate\(self\.{container}\):\s*$",
+        re.MULTILINE,
+    )
+    loop_match = loop_pattern.search(source)
     if loop_match is None:
-        logger.warning("[MemControl] H3 prefetch patch skipped: expected block loop not found")
+        logger.warning(
+            "[MemControl] prefetch patch skipped: expected %s loop not found",
+            container,
+        )
         return None
 
     indent = loop_match.group(1)
     loop_replacement = (
-        f"{indent}for i in range(len(self.blocks)):\n"
-        f"{indent}    block = self.blocks[i]\n"
+        f"{indent}for i in range(len(self.{container})):\n"
+        f"{indent}    {item} = self.{container}[i]\n"
     )
     source = source[:loop_match.start()] + loop_replacement + source[loop_match.end():]
 
@@ -57,9 +73,16 @@ def _make_prefetch_free_forward(original):
             namespace,
         )
     except Exception as exc:
-        logger.warning("[MemControl] H3 prefetch patch compile failed: %s", exc)
+        logger.warning("[MemControl] prefetch patch compile failed: %s", exc)
         return None
     return namespace.get(original.__name__)
+
+
+QWEN_PREFETCH_SOURCE = (
+    "prefetch_queue = comfy.model_prefetch.make_prefetch_queue("
+    'list(self.layers), x.device, {"prefetch_dynamic_vbars": '
+    'getattr(self, "prefetch_dynamic_vbars", False)})'
+)
 
 
 def _patch_h3_prefetch(model) -> None:
@@ -91,7 +114,54 @@ def _patch_h3_prefetch(model) -> None:
     logger.info("[MemControl] patched H3 _forward: prefetch queue disabled, block loop uses MemControl indexing")
 
 
-def _install_roots(manager, model, clip, manage_qwen: bool = False):
+def _patch_qwen_prefetch(manager, clip) -> None:
+    if clip is None:
+        return
+    patcher = getattr(clip, "patcher", None)
+    if patcher is None:
+        return
+
+    existing = getattr(patcher, "_memcontrol_qwen_prefetch_forward", None)
+    if existing is not None:
+        try:
+            if patcher.get_model_object(existing["path"]) == existing["bound"]:
+                return
+        except Exception:
+            pass
+
+    for parent_ref, name, orig, swl, install_root in manager.installations:
+        if install_root != "clip" or name != "layers":
+            continue
+        parent_path = swl.container_path.rsplit(".", 1)[0]
+        if not parent_path:
+            continue
+        parent = parent_ref()
+        original = getattr(type(parent), "forward", None) if parent is not None else None
+        if original is None:
+            continue
+
+        new_forward = _make_prefetch_free_forward(
+            original,
+            container="layers",
+            item="layer",
+            prefetch_source=QWEN_PREFETCH_SOURCE,
+        )
+        if new_forward is None:
+            continue
+
+        bound = types.MethodType(new_forward, parent)
+        patch_path = f"{parent_path}.forward"
+        patcher.add_object_patch(patch_path, bound)
+        patcher._memcontrol_qwen_prefetch_forward = {
+            "path": patch_path,
+            "bound": bound,
+        }
+        logger.info("[MemControl] patched qwen forward: prefetch queue disabled, layer loop uses MemControl indexing")
+        return
+    logger.warning("[MemControl] qwen prefetch patch skipped: managed layers container not found")
+
+
+def _install_roots(manager, model, clip, manage_qwen: bool = True):
     seen: set[int] = set()
     if model is not None:
         try:
@@ -118,11 +188,13 @@ def _install_roots(manager, model, clip, manage_qwen: bool = False):
                 logger.warning("[MemControl] clip container scan failed: %s", exc)
         try:
             manager.patch_load_list(patcher, "clip")
+            _patch_qwen_prefetch(manager, clip)
+            logger.info("[MemControl] qwen managed by MemControl (manage_qwen=True)")
         except Exception as exc:
             logger.warning("[MemControl] clip patcher filter failed: %s", exc)
     elif clip is not None:
         manager.native_clip = True
-        logger.info("[MemControl] qwen managed by Comfy native dynamic VRAM (manage_qwen=False)")
+        logger.info("[MemControl] qwen explicitly left to Comfy native dynamic VRAM (manage_qwen=False)")
 
 
 class H3MemControlSetup(io.ComfyNode):
@@ -146,8 +218,8 @@ class H3MemControlSetup(io.ComfyNode):
                 io.Vae.Input("audio_vae", optional=True),
                 io.Boolean.Input(
                     "manage_qwen",
-                    default=False,
-                    tooltip="Experimental: let H3MemControl schedule qwen blocks. Default off; qwen uses Comfy native dynamic VRAM until vbar-based qwen handling is stable.",
+                    default=True,
+                    tooltip="MemControl owns qwen layer scheduling by default. Set false only as an explicit Comfy-native fallback.",
                 ),
             ],
             outputs=[
@@ -159,7 +231,7 @@ class H3MemControlSetup(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, clip=None, vae=None, audio_vae=None, manage_qwen=False) -> io.NodeOutput:
+    def execute(cls, model, clip=None, vae=None, audio_vae=None, manage_qwen=True) -> io.NodeOutput:
         manager = registry.create_manager()
         log_memory("setup_start")
         _install_roots(manager, model, clip, manage_qwen=manage_qwen)
@@ -180,7 +252,7 @@ class H3MemControlSetup(io.ComfyNode):
                 format_bytes(stat["size_bytes"]),
                 format_bytes(stat["max_block_bytes"]),
             )
-            if stat["root"] == "clip" and "transformer.model.layers" in stat["container"]:
+            if stat["root"] == "clip" and stat["container"].endswith(".layers"):
                 manager.set_container_limit(stat["container"], stat["max_block_bytes"])
             if stat["root"] == "model" and stat["container"].endswith("diffusion_model.blocks"):
                 manager.set_container_limit(stat["container"], stat["max_block_bytes"] * 2)
@@ -199,8 +271,8 @@ class H3MemControlCleanup(io.ComfyNode):
             category="h3/memcontrol",
             description=(
                 "Restores MemControl-wrapped block containers and releases buffer/LoRA state. "
-                "Auto cleanup also unloads native qwen/VAE models before managed H3 work starts. "
-                "It does not clear user IO such as prompt, seed, images, or video previews."
+                "Auto cleanup releases qwen after text encoding and H3 after sampling when those "
+                "managed roots were used. It does not clear user IO such as prompt, seed, images, or video previews."
             ),
             search_aliases=["h3 memcontrol cleanup", "h3 mem control cleanup"],
             inputs=[
