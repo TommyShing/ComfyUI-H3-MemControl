@@ -33,6 +33,12 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 6. Verify cached VAEs are released from VRAM after encode/decode and stay cached in RAM.
 7. Only after those checks pass, treat the architecture as accepted and run the full VAE decode path.
 
+## Latest Real Run Analysis
+
+- qwen was still logged as `manage_qwen=False`, so the workflow/UI was overriding MemControl; the switch has been removed so this cannot happen again.
+- H3 OOM occurred during attention while two H3 blocks and token_refiner blocks were resident; each managed container now holds only one block at a time.
+- VAE release-after-use is now wrapped into the cached VAE encode/decode path, but still needs a real workflow run.
+
 ## Current Evidence
 
 - Unit tests: 11 passed.
