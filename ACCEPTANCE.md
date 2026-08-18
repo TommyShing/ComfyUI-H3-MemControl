@@ -14,7 +14,7 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 
 | # | Check | Pass criteria | Current status |
 |---|---|---|---|
-| 1 | Setup registers qwen and H3 | Default `manage_qwen=true`; logs show qwen layers and H3 blocks | Unit verified, runtime pending |
+| 1 | Setup registers qwen and H3 | Setup always registers qwen layers and H3 blocks | Unit verified, runtime pending |
 | 2 | qwen no prefetch scan | `list(self.layers)` no longer schedules layers; only real forward access logs appear | Unit verified, runtime pending |
 | 3 | qwen released after text encoding | Cleanup node releases qwen resident blocks and VRAM drops | Code path present, runtime pending |
 | 4 | H3 no prefetch scan | No first pass over `blocks`; each real block access starts at count=1 | Unit verified, runtime pending |
@@ -25,11 +25,12 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 
 ## Current Plan
 
-1. Keep qwen and H3 owned by MemControl, with Comfy excluded from loading/prefetching their layers.
-2. Verify on the real workflow that qwen is released by the cleanup node after text encoding and before H3 sampling.
-3. Verify on the real workflow that H3 no longer pre-scans blocks and only loads one managed block for real forward access.
-4. If the real run still OOMs, use the `evict_after_*` memory logs to separate "weights were not released" from "activations/other models still occupy VRAM".
-5. Only after those checks pass, treat the architecture as accepted and run the full VAE decode path.
+1. Keep qwen and H3 owned by MemControl, with Comfy excluded from loading/prefetching their layers; no fallback switch.
+2. Keep one layer/block resident per managed container so attention peaks have the most possible VRAM headroom.
+3. Verify on the real workflow that qwen is released by the cleanup node after text encoding and before H3 sampling.
+4. Verify on the real workflow that H3 no longer pre-scans blocks and only loads one managed block for real forward access.
+5. If the real run still OOMs, use the `evict_after_*` memory logs to separate "weights were not released" from "activations/other models still occupy VRAM".
+6. Only after those checks pass, treat the architecture as accepted and run the full VAE decode path.
 
 ## Current Evidence
 

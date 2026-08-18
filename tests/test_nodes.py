@@ -112,9 +112,9 @@ class NodeSchemaTests(unittest.TestCase):
         self.assertNotIn("enumerate", names)
         self.assertIn("range", names)
 
-    def test_setup_default_manages_qwen(self):
+    def test_setup_has_no_manage_qwen_switch(self):
         schema = nodes.H3MemControlSetup.GET_SCHEMA()
-        self.assertTrue(any(getattr(item, "default", None) is True for item in schema.inputs))
+        self.assertEqual(len(schema.inputs), 4)
 
     def test_qwen_patch_applied_to_managed_layers_parent(self):
         root = FakeQwenRoot()

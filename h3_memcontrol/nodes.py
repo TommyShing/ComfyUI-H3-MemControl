@@ -161,7 +161,7 @@ def _patch_qwen_prefetch(manager, clip) -> None:
     logger.warning("[MemControl] qwen prefetch patch skipped: managed layers container not found")
 
 
-def _install_roots(manager, model, clip, manage_qwen: bool = True):
+def _install_roots(manager, model, clip):
     seen: set[int] = set()
     if model is not None:
         try:
@@ -171,7 +171,7 @@ def _install_roots(manager, model, clip, manage_qwen: bool = True):
             _patch_h3_prefetch(model)
         except Exception as exc:
             logger.warning("[MemControl] model container scan failed: %s", exc)
-    if clip is not None and manage_qwen:
+    if clip is not None:
         patcher = getattr(clip, "patcher", None)
         clip_device = getattr(patcher, "load_device", None)
         roots = []
@@ -189,12 +189,9 @@ def _install_roots(manager, model, clip, manage_qwen: bool = True):
         try:
             manager.patch_load_list(patcher, "clip")
             _patch_qwen_prefetch(manager, clip)
-            logger.info("[MemControl] qwen managed by MemControl (manage_qwen=True)")
+            logger.info("[MemControl] qwen managed by MemControl")
         except Exception as exc:
             logger.warning("[MemControl] clip patcher filter failed: %s", exc)
-    elif clip is not None:
-        manager.native_clip = True
-        logger.info("[MemControl] qwen explicitly left to Comfy native dynamic VRAM (manage_qwen=False)")
 
 
 class H3MemControlSetup(io.ComfyNode):
@@ -216,11 +213,6 @@ class H3MemControlSetup(io.ComfyNode):
                 io.Clip.Input("clip", optional=True),
                 io.Vae.Input("vae", optional=True),
                 io.Vae.Input("audio_vae", optional=True),
-                io.Boolean.Input(
-                    "manage_qwen",
-                    default=True,
-                    tooltip="MemControl owns qwen layer scheduling by default. Set false only as an explicit Comfy-native fallback.",
-                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -231,10 +223,10 @@ class H3MemControlSetup(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, clip=None, vae=None, audio_vae=None, manage_qwen=True) -> io.NodeOutput:
+    def execute(cls, model, clip=None, vae=None, audio_vae=None) -> io.NodeOutput:
         manager = registry.create_manager()
         log_memory("setup_start")
-        _install_roots(manager, model, clip, manage_qwen=manage_qwen)
+        _install_roots(manager, model, clip)
         vae = _cache_vae(vae)
         audio_vae = _cache_vae(audio_vae)
         logger.info(
@@ -254,14 +246,14 @@ class H3MemControlSetup(io.ComfyNode):
             )
             if stat["root"] == "clip" and stat["container"].endswith(".layers"):
                 manager.set_container_limit(stat["container"], stat["max_block_bytes"])
-            if stat["root"] == "model" and stat["container"].endswith("diffusion_model.blocks"):
-                manager.set_container_limit(stat["container"], stat["max_block_bytes"] * 2)
+            if stat["root"] == "model" and stat["container"].endswith(".blocks"):
+                manager.set_container_limit(stat["container"], stat["max_block_bytes"])
         log_memory("setup_done")
         return io.NodeOutput(model, clip, vae, audio_vae)
 
 
 class H3MemControlCleanup(io.ComfyNode):
-    """Release managed block state, buffers, and LoRA references while passing data through."""
+    """Release managed block state while passing data through."""
 
     @classmethod
     def define_schema(cls):
@@ -270,7 +262,7 @@ class H3MemControlCleanup(io.ComfyNode):
             display_name="H3 MemControl Cleanup",
             category="h3/memcontrol",
             description=(
-                "Restores MemControl-wrapped block containers and releases buffer/LoRA state. "
+                "Restores MemControl-wrapped block containers and releases managed block state. "
                 "Auto cleanup releases qwen after text encoding and H3 after sampling when those "
                 "managed roots were used. It does not clear user IO such as prompt, seed, images, or video previews."
             ),
@@ -281,7 +273,7 @@ class H3MemControlCleanup(io.ComfyNode):
                     "stage",
                     options=["auto", "after_te", "after_sampling", "full"],
                     default="auto",
-                    tooltip="after_te cleans qwen containers; after_sampling cleans H3 containers and releases buffer.",
+                    tooltip="after_te cleans qwen containers; after_sampling cleans H3 containers.",
                 ),
             ],
             outputs=[io.AnyType.Output(display_name="passthrough")],
@@ -293,9 +285,9 @@ class H3MemControlCleanup(io.ComfyNode):
         if stage == "auto":
             registry.cleanup_auto()
         elif stage == "after_sampling":
-            registry.cleanup_root("model", release_buffer=True)
+            registry.cleanup_root("model")
         elif stage == "after_te":
-            registry.cleanup_root("clip", release_buffer=False)
+            registry.cleanup_root("clip")
         elif stage == "full":
             registry.cleanup_all()
         logger.info("[MemControl] cleanup stage=%s complete", stage)

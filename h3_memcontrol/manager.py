@@ -19,20 +19,6 @@ import torch.nn as nn
 
 logger = logging.getLogger("H3MemControl")
 
-CONTAINER_NAMES = (
-    "blocks",
-    "transformer_blocks",
-    "double_blocks",
-    "single_blocks",
-    "input_blocks",
-    "output_blocks",
-    "middle_block",
-    "layers",
-    "double_stream_layers",
-    "single_stream_layers",
-    "block",
-)
-
 
 def format_bytes(value: float | int) -> str:
     value = float(value)
@@ -80,15 +66,6 @@ def module_bytes(module: nn.Module) -> int:
     for b in module.buffers():
         total += b.numel() * b.element_size()
     return total
-
-
-def is_resident(module: nn.Module, device: torch.device | None = None) -> bool:
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    params = list(module.parameters(recurse=True))
-    if not params:
-        return False
-    return all(p.device == device for p in params)
 
 
 def _has_meta_params(module: nn.Module) -> bool:
@@ -157,12 +134,14 @@ def _vae_path(vae: Any) -> str | None:
 class MemControlModuleList(nn.ModuleList):
     """ModuleList replacement that logs block access without moving weights yet."""
 
-    def __init__(self, modules, manager, container_name: str, container_path: str, root_device=None):
+    def __init__(self, modules, manager, container_name: str, container_path: str, root_name: str, root_device=None):
         super().__init__(modules)
         self.memcontrol_manager_ref = weakref.ref(manager)
         self.container_name = container_name
         self.container_path = container_path
+        self.root_name = root_name
         self.root_device = root_device
+        self._block_sizes = [module_bytes(module) for module in modules]
         self._access_counts: dict[int, int] = {}
         self._last_resident: dict[int, bool] = {}
 
@@ -172,18 +151,13 @@ class MemControlModuleList(nn.ModuleList):
             return
         count = self._access_counts.get(idx, 0) + 1
         self._access_counts[idx] = count
-        try:
-            block = self._modules[str(idx)]
-            size = module_bytes(block)
-        except Exception:
-            size = 0
+        block = self._modules[str(idx)]
+        size = self._block_sizes[idx] if idx < len(self._block_sizes) else 0
         resident = False
         try:
             resident = manager.ensure_block(self.container_path, idx, block, size, self.root_device)
         except Exception as exc:
             logger.warning("[MemControl] ensure_block failed %s[%d]: %s", self.container_path, idx, exc)
-
-        manager.record_access(self.container_path, idx, size, resident)
 
         prev = self._last_resident.get(idx)
         should_log = count <= 3 or count % 50 == 0 or prev != resident
@@ -208,50 +182,19 @@ class MemControlModuleList(nn.ModuleList):
             yield self[idx]
 
 
-class MemControlBufferPool:
-    """Placeholder for the shared transfer/cast buffer lifecycle."""
-
-    def __init__(self):
-        self.created = False
-        self.allocated_bytes = 0
-        self.max_bytes = 0
-
-    def reserve(self, size_bytes: int) -> None:
-        self.created = True
-        self.allocated_bytes = size_bytes
-        self.max_bytes = max(self.max_bytes, size_bytes)
-        logger.info(
-            "[MemControl] buffer reserve size=%s max=%s",
-            format_bytes(size_bytes),
-            format_bytes(self.max_bytes),
-        )
-
-    def release(self) -> None:
-        if self.allocated_bytes or self.created:
-            logger.info(
-                "[MemControl] buffer release size=%s max=%s",
-                format_bytes(self.allocated_bytes),
-                format_bytes(self.max_bytes),
-            )
-        self.created = False
-        self.allocated_bytes = 0
-
-
 class MemControlManager:
     def __init__(self, headroom_bytes: int = 768 * 1024 ** 2):
         self.manager_id = uuid.uuid4().hex[:12]
         self.headroom_bytes = headroom_bytes
         self.installations: list[tuple[weakref.ReferenceType, str, nn.ModuleList, MemControlModuleList, str]] = []
         self.patcher_filters: list[tuple[Any, Any, str]] = []
-        self.buffer_pool = MemControlBufferPool()
-        self.last_access: dict[tuple[str, int], tuple[float, int, bool]] = {}
-        self.resident: dict[tuple[str, int], tuple[MemControlModuleList, int, str]] = {}
+        self.resident: dict[tuple[str, int], tuple[MemControlModuleList, int, str, int]] = {}
         self.last_used: dict[tuple[str, int], float] = {}
         self.managed_module_ids: set[int] = set()
         self.container_limits: dict[str, int] = {}
+        self.path_to_swl: dict[str, MemControlModuleList] = {}
         self.model_accessed = False
         self.clip_accessed = False
-        self.native_clip = False
         self.created_at = time.time()
 
     def install_on_root(
@@ -264,8 +207,9 @@ class MemControlManager:
         for name, orig, parent, child_path in find_block_containers(root, seen=seen):
             if isinstance(orig, MemControlModuleList):
                 continue
-            swl = MemControlModuleList(orig, self, name, child_path, root_device)
+            swl = MemControlModuleList(orig, self, name, child_path, root_name, root_device)
             setattr(parent, name, swl)
+            self.path_to_swl[child_path] = swl
             self.installations.append((weakref.ref(parent), name, orig, swl, root_name))
             for block in orig:
                 for module in block.modules():
@@ -311,9 +255,6 @@ class MemControlManager:
         self.patcher_filters.append((patcher, original, root_name))
         logger.info("[MemControl] patched _load_list root=%s", root_name)
 
-    def record_access(self, container_path: str, idx: int, size: int, resident: bool) -> None:
-        self.last_access[(container_path, idx)] = (time.time(), size, resident)
-
     def set_container_limit(self, container_path: str, limit_bytes: int) -> None:
         self.container_limits[container_path] = int(limit_bytes)
         logger.info(
@@ -323,33 +264,17 @@ class MemControlManager:
         )
 
     def _resident_bytes(self) -> int:
-        total = 0
-        for key in self.resident:
-            try:
-                swl, idx, _ = self.resident[key]
-                total += module_bytes(swl._modules[str(idx)])
-            except Exception:
-                pass
-        return total
+        return sum(entry[3] for entry in self.resident.values())
 
     def _container_resident_bytes(self, container_path: str) -> int:
-        total = 0
-        for key in self.resident:
-            if key[0] != container_path:
-                continue
-            try:
-                swl, idx, _ = self.resident[key]
-                total += module_bytes(swl._modules[str(idx)])
-            except Exception:
-                pass
-        return total
+        return sum(entry[3] for key, entry in self.resident.items() if key[0] == container_path)
 
     def _evict(self, key: tuple[str, int]) -> None:
         resident_entry = self.resident.pop(key, None)
         self.last_used.pop(key, None)
         if resident_entry is None:
             return
-        swl, idx, root_name = resident_entry
+        swl, idx, root_name, _ = resident_entry
         try:
             block = swl._modules[str(idx)]
             if torch.cuda.is_available():
@@ -423,7 +348,7 @@ class MemControlManager:
 
         _backup_param_refs(block)
         block.to(compute_device)
-        self.resident[key] = (self._get_swl_by_path(container_path), idx, self._root_for_path(container_path))
+        self.resident[key] = (self._get_swl_by_path(container_path), idx, root_name, size)
         self.last_used[key] = time.time()
         logger.info(
             "[MemControl] load %s[%d] size=%s resident=%d",
@@ -435,27 +360,17 @@ class MemControlManager:
         return True
 
     def _get_swl_by_path(self, container_path: str) -> MemControlModuleList | None:
-        for parent_ref, name, orig, swl, root_name in self.installations:
-            if swl.container_path == container_path:
-                return swl
-        return None
+        return self.path_to_swl.get(container_path)
 
     def _root_for_path(self, container_path: str) -> str:
-        for parent_ref, name, orig, swl, root_name in self.installations:
-            if swl.container_path == container_path:
-                return root_name
-        return "unknown"
+        swl = self.path_to_swl.get(container_path)
+        return swl.root_name if swl is not None else "unknown"
 
     def container_stats(self) -> list[dict[str, Any]]:
         stats = []
         for parent_ref, name, orig, swl, root_name in self.installations:
             total = len(swl)
-            sizes = []
-            for i in range(total):
-                try:
-                    sizes.append(module_bytes(swl._modules[str(i)]))
-                except Exception:
-                    sizes.append(0)
+            sizes = list(swl._block_sizes)
             stats.append(
                 {
                     "root": root_name,
@@ -469,10 +384,10 @@ class MemControlManager:
         return stats
 
     def _release_root_resident(self, root_name: str) -> None:
-        for key in [k for k, (_, _, r) in self.resident.items() if r == root_name]:
+        for key in [k for k, (_, _, r, _) in self.resident.items() if r == root_name]:
             self._evict(key)
 
-    def cleanup_root(self, root_name: str, release_buffer: bool = False) -> None:
+    def cleanup_root(self, root_name: str) -> None:
         remaining = []
         for parent_ref, name, orig, swl, install_root in self.installations:
             if install_root == root_name:
@@ -497,40 +412,18 @@ class MemControlManager:
             else:
                 kept_filters.append((patcher, original, filter_root))
         self.patcher_filters = kept_filters
-
-        if release_buffer:
-            self.buffer_pool.release()
         log_memory(f"cleanup_{root_name}")
-
-    def _unload_native_models(self) -> None:
-        try:
-            import comfy.model_management as model_management
-
-            model_management.unload_all_models()
-            logger.info("[MemControl] unloaded native Comfy models before managed model work")
-        except Exception as exc:
-            logger.warning("[MemControl] failed to unload native Comfy models: %s", exc)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     def cleanup_auto(self) -> None:
         log_memory("cleanup_auto")
         if self.model_accessed:
             logger.info("[MemControl] cleanup_auto model_accessed=True -> cleanup model")
-            self.cleanup_root("model", release_buffer=True)
+            self.cleanup_root("model")
         if self.clip_accessed:
             logger.info("[MemControl] cleanup_auto clip_accessed=True -> cleanup clip")
-            self.cleanup_root("clip", release_buffer=False)
+            self.cleanup_root("clip")
         if not self.model_accessed and not self.clip_accessed:
-            if self.native_clip:
-                logger.info("[MemControl] cleanup_auto no managed block accessed yet; unloading native qwen/VAE")
-                self._unload_native_models()
-                log_memory("cleanup_auto_native")
-            else:
-                logger.info("[MemControl] cleanup_auto no block accessed yet -> skip")
+            logger.info("[MemControl] cleanup_auto no block accessed yet -> skip")
 
     def cleanup(self) -> None:
         for key in list(self.resident):
@@ -553,8 +446,6 @@ class MemControlManager:
             except Exception:
                 pass
         self.patcher_filters.clear()
-        self.last_access.clear()
-        self.buffer_pool.release()
         log_memory("cleanup")
 
 
@@ -573,9 +464,9 @@ class _Registry:
     def get_manager(self, manager_id: str) -> MemControlManager | None:
         return self.managers.get(manager_id)
 
-    def cleanup_root(self, root_name: str, release_buffer: bool = False) -> None:
+    def cleanup_root(self, root_name: str) -> None:
         for manager in list(self.managers.values()):
-            manager.cleanup_root(root_name, release_buffer=release_buffer)
+            manager.cleanup_root(root_name)
 
     def cleanup_auto(self) -> None:
         for manager in list(self.managers.values()):
