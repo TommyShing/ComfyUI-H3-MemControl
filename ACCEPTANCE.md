@@ -1,6 +1,6 @@
 # H3 MemControl Acceptance
 
-Read-only test plan for the current MemControl architecture. ComfyUI files are never modified.
+Acceptance and current plan for the MemControl test build. ComfyUI files are never modified.
 
 ## Lifecycle Under Test
 
@@ -22,6 +22,14 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 | 6 | VAE cache | One instance per file path for process lifetime; VAE only in VRAM during decode | Cache code present, runtime pending |
 | 7 | No ComfyUI changes | Git diff and repo contain no edits under ComfyUI path | Pass |
 | 8 | 8GB workflow completes | qwen completes, H3 completes, VAE decode completes without OOM | Pending real workflow test |
+
+## Current Plan
+
+1. Keep qwen and H3 owned by MemControl, with Comfy excluded from loading/prefetching their layers.
+2. Verify on the real workflow that qwen is released by the cleanup node after text encoding and before H3 sampling.
+3. Verify on the real workflow that H3 no longer pre-scans blocks and only loads one managed block for real forward access.
+4. If the real run still OOMs, use the `evict_after_*` memory logs to separate "weights were not released" from "activations/other models still occupy VRAM".
+5. Only after those checks pass, treat the architecture as accepted and run the full VAE decode path.
 
 ## Current Evidence
 
