@@ -5,7 +5,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from h3_memcontrol.manager import MemControlManager, module_bytes, registry
+from h3_memcontrol.manager import MemControlManager, _clear_comfy_module_state, module_bytes, registry
 
 
 class Block(nn.Module):
@@ -49,6 +49,18 @@ class ManagerTests(unittest.TestCase):
         cached = registry.cache_vae(vae)
         self.assertIs(cached, vae)
         self.assertIs(registry.get_vae(vae), vae)
+
+    def test_clear_comfy_module_state_removes_cached_tensors(self):
+        module = nn.Linear(4, 4)
+        module._prefetch = object()
+        module._v_weight = object()
+        module._v_bias = object()
+
+        _clear_comfy_module_state(module)
+
+        self.assertFalse(hasattr(module, "_prefetch"))
+        self.assertFalse(hasattr(module, "_v_weight"))
+        self.assertFalse(hasattr(module, "_v_bias"))
 
 
 class CudaLayer(nn.Module):

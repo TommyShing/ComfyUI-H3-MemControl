@@ -101,6 +101,25 @@ def _restore_param_refs(module: nn.Module) -> None:
         delattr(module, "_memcontrol_buffer_refs")
 
 
+def _clear_comfy_module_state(module: nn.Module) -> None:
+    try:
+        import comfy.model_prefetch
+
+        comfy_modules = [m for m in module.modules() if hasattr(m, "_prefetch")]
+        if comfy_modules:
+            comfy.model_prefetch.cleanup_prefetched_modules(module, comfy_modules)
+    except Exception:
+        pass
+
+    for child in module.modules():
+        for attr in ("_prefetch", "_v_weight", "_v_bias", "_v_signature", "_v_block_faulted"):
+            if hasattr(child, attr):
+                try:
+                    delattr(child, attr)
+                except Exception:
+                    pass
+
+
 def find_block_containers(
     root: nn.Module,
     depth: int = 0,
@@ -279,6 +298,7 @@ class MemControlManager:
             block = swl._modules[str(idx)]
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            _clear_comfy_module_state(block)
             _restore_param_refs(block)
             gc.collect()
             if torch.cuda.is_available():

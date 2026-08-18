@@ -41,9 +41,10 @@ VAE: 常驻内存 -> 解码时进显存 -> 解码完回内存
 
 ## Current Evidence
 
-- Unit tests: 11 passed.
+- Unit tests: 12 passed.
 - Compile check: passed.
 - H3 `_forward` patch compiles against current Comfy source.
 - Qwen `Llama2_.forward` patch compiles against current Comfy source.
 - CUDA microtest: qwen-like layer container with a one-layer limit keeps only the active layer resident and returns weights to CPU after cleanup.
 - CUDA microtest: MemControl evict/restore returns managed weights to CPU and clears resident state after cleanup.
+- Unit test: MemControl clears Comfy prefetch/cast attributes during evict.
