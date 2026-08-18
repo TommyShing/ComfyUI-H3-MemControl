@@ -364,6 +364,7 @@ class MemControlManager:
                 swl.container_path,
                 idx,
             )
+            log_memory(f"evict_after_{swl.container_path}_{idx}")
         except Exception as exc:
             logger.warning("[MemControl] evict failed %s[%d]: %s", swl.container_path, idx, exc)
 
