@@ -60,6 +60,45 @@ Conclusion:
 - No-Comfy-edit constraint is respected; runtime patching from custom nodes is
   still on the table.
 
+## Stage Occupancy Model
+
+Each stage is sequential and uses its own weights. Stage weights and compute
+temporaries should be modeled together, not as separate global items.
+
+```text
+H       = persistent hidden state, size S * D * bytes
+W_i     = weights needed by stage i, split into sequentially used pieces
+T_i     = temporary compute memory for stage i, split by chunk size C
+Base    = Comfy/other base runtime
+
+Stage peak = Base + H + max over pieces( piece_weight + piece_temp )
+```
+
+Because pieces are sequential, the peak is not the sum of all stage weights and
+all stage temporaries. Each stage has different weight values, but the shape and
+size pattern is similar. Chunking replaces `S` with `C` for temporaries; weight
+pieces depend on the chosen granularity.
+
+## Dynamic Async Policy
+
+Async buffer size is not fixed at one full layer. It should be sized to the next
+weight/compute piece that would actually be prefetched.
+
+```text
+Before prefetching next piece:
+estimate = Base + H + current_piece_peak + next_piece_buffer
+
+if estimate <= 8GB budget:
+    use the second async stream to prefetch
+else:
+    do not prefetch
+    load the next piece synchronously when needed
+```
+
+This lets small consecutive pieces overlap while avoiding OOM. MemControl owns
+the decision and tracks actual per-stage/per-piece sizes instead of assuming a
+constant buffer.
+
 ## Implementation Direction
 
 1. Keep high precision for norms/residual/RoPE/final output.
