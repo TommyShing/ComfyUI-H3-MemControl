@@ -86,8 +86,13 @@ Assumptions:
 
 Async loading is included: one cast buffer is roughly the size of the weight being
 transferred. qwen weight is about 0.9GB, so two async buffers are about 1.8GB.
-H3 block is about 0.7GB, so two async buffers are about 1.4GB. MemControl should
-clear these between phases and can reduce or disable async streams if needed.
+H3 block is about 0.7GB, so two async buffers are about 1.4GB. MemControl will
+force one stream or zero streams during managed phases and clear the buffers
+between phases, so the two-buffer worst case is not accepted as normal.
+
+In the encoding node, qwen encoding runs first; VAE encode runs only when
+keyframes/references exist, after qwen has finished. They are sequential, not
+simultaneous. MemControl's VAE wrapper also releases VAE VRAM after each use.
 
 Phases are sequential, not simultaneous:
 
