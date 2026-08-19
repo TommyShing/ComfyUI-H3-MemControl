@@ -82,17 +82,21 @@ pieces depend on the chosen granularity.
 ## qwen H and MLP Detail
 
 H is the persistent hidden state and must stay in VRAM during a layer because
-it is used by norm and residual paths. The 6-step table below lists step
-intermediates separately from H. At 55k tokens H is about 0.55GB.
+it is used by norm and residual paths. At 55k tokens the persistent H is about
+0.55GB.
 
-| Step | dequant VRAM weight | step intermediate (excluding H) |
+The table below lists step weights and step `w_mid`. `w_mid` already includes
+H-size tensors created by that step (for norm/residual, that is an additional
+H-size tensor, not the persistent H itself).
+
+| Step | dequant VRAM weight | step w_mid |
 |---|---|---|
-| norm | ~0 | 0.55GB |
-| attention | 0.2-0.3GB | 1.5-2.5GB |
-| residual | 0 | 0.55GB |
-| norm | ~0 | 0.55GB |
-| MLP | 1.3-1.5GB | 2.8-5.6GB |
-| residual | 0 | 0.55GB |
+| norm | ~0 | 0.55GB (H-size normalized output) |
+| attention | 0.2-0.3GB | 1.5-2.5GB (Q/K/V + output, persistent H separate) |
+| residual | 0 | 0.55GB (H-size sum) |
+| norm | ~0 | 0.55GB (H-size normalized output) |
+| MLP | 1.3-1.5GB | 2.8-5.6GB (MLP intermediates, H-size inputs separate) |
+| residual | 0 | 0.55GB (H-size sum) |
 
 MLP sub-steps:
 
