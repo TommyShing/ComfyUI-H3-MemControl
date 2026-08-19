@@ -81,34 +81,30 @@ pieces depend on the chosen granularity.
 
 ## qwen H and MLP Detail
 
-H is the persistent hidden state and must stay in VRAM during a layer because
-it is used by norm and residual paths. At 55k tokens the persistent H is about
-0.55GB.
+H0 is the persistent hidden state, about 0.55GB at 55k tokens. The table below
+includes H0 and all H-size tensors inside `w_mid`; weight is listed separately.
 
-The table below lists step weights and step `w_mid`. `w_mid` already includes
-H-size tensors created by that step (for norm/residual, that is an additional
-H-size tensor, not the persistent H itself).
+| Step | dequant VRAM weight | live w_mid (including all H) | step peak |
+|---|---|---|---|
+| norm | ~0 | H0 0.55 + norm output 0.55 = 1.1 | 1.1 |
+| attention | 0.2-0.3 | H0 0.55 + normalized input 0.55 + Q/K/V 0.7-1.1 + output 0.6-0.9 = 2.4-3.1 | 2.6-3.4 |
+| residual | 0 | H0 0.55 | 0.55 |
+| norm | ~0 | H0 0.55 + norm output 0.55 = 1.1 | 1.1 |
+| MLP | 1.3-1.5 | H0 0.55 + MLP input 0.55 + gate/up/product 2.8-5.6 = 3.9-6.7 | 5.2-8.2 |
+| residual | 0 | H0 0.55 | 0.55 |
 
-| Step | dequant VRAM weight | step w_mid |
-|---|---|---|
-| norm | ~0 | 0.55GB (H-size normalized output) |
-| attention | 0.2-0.3GB | 1.5-2.5GB (Q/K/V + output, persistent H separate) |
-| residual | 0 | 0.55GB (H-size sum) |
-| norm | ~0 | 0.55GB (H-size normalized output) |
-| MLP | 1.3-1.5GB | 2.8-5.6GB (MLP intermediates, H-size inputs separate) |
-| residual | 0 | 0.55GB (H-size sum) |
+MLP sub-steps (H0 0.55 and MLP input 0.55 are always additional):
 
-MLP sub-steps:
-
-| MLP sub-step | dequant VRAM weight | intermediate |
+| MLP sub-step | dequant VRAM weight | step intermediate |
 |---|---|---|
 | gate | 0.4-0.5GB | 2.8GB |
 | up | 0.4-0.5GB | 2.8GB |
 | product | 0 | 2.8GB |
 | down | 0.4-0.5GB | input 2.8GB + output 0.55GB |
 
-If gate/up are evaluated with both alive, peak is about 5.6GB for the MLP
-intermediate. Chunking or fusing reduces that to the chunk size.
+If gate/up are evaluated with both alive, the MLP step adds about 5.6GB of
+intermediate on top of H0 0.55 + MLP input 0.55. Chunking or fusing reduces
+that to the chunk size.
 
 ## Dynamic Async Policy
 
