@@ -81,30 +81,34 @@ Assumptions:
 - Only one qwen layer or one H3 block is active at a time.
 - Runtime cast buffers/caches live in VRAM and are cleared by MemControl at phase boundaries.
 - Attention/MLP use chunking where supported.
+- Async weight loading can keep up to two full-weight-sized cast buffers in VRAM.
 - 8GB card, about 7.6-7.7GB usable after driver/other overhead.
 
-| Component | Estimated peak |
-|---|---|
-| Comfy/VAE/base runtime | 1.0-1.6 GB |
-| qwen current int8 weight in VRAM | 0.9 GB (if int8 linear) |
-| qwen dequant bf16 fallback weight | 1.9 GB (if fallback needed) |
-| qwen text-only activations | 0.5-1.5 GB |
-| qwen with reference/video tokens | 1-4 GB, depends on token count |
-| H3 one current block | 0.7 GB |
-| H3 chunked attention/MLP activations | 1-4 GB |
-| VAE decode | 0.5-2 GB |
+Async loading is included: one cast buffer is roughly the size of the weight being
+transferred. qwen weight is about 0.9GB, so two async buffers are about 1.8GB.
+H3 block is about 0.7GB, so two async buffers are about 1.4GB. MemControl should
+clear these between phases and can reduce or disable async streams if needed.
 
-Realistic peak for the intended plan:
+Phases are sequential, not simultaneous:
 
 ```text
-base 1.6 + qwen int8 weight 0.9 + qwen activations 1.5 + bounded cast buffers 1-2
-= about 5-6 GB
+Phase 1: qwen text encode
+Phase 2: H3 sampling
+Phase 3: VAE decode
 ```
 
-That fits an 8GB card if caches are cleared and only one model phase is active.
-The previous OOM came from whole-layer `block.to(cuda)` plus unmanaged cast
-buffers, which are outside this plan. If reference/video token count is large,
-the estimate should be verified with actual logs before accepting the plan.
+Do not add all three phases together.
+
+| Phase | Estimated peak |
+|---|---|
+| qwen text-only | base 1.6 + current int8 weight 0.9 + activations 0.5-1.5 + cast buffers 0.9-1.8 = 3.9-5.8 GB |
+| qwen with reference/video | base 1.6 + current int8 weight 0.9 + activations 1-4 + cast buffers 0.9-1.8 = 4.4-8.3 GB |
+| H3 chunked | base 1.6 + current block 0.7 + activations 1-4 + cast buffers 0.7-1.4 = 4.0-7.7 GB |
+| VAE decode | base 1.6 + VAE 0.5-1 + decode activations 0.5-1.5 = 2.6-4.1 GB |
+
+The intended plan fits 8GB for text-only qwen and H3 if MemControl clears cast
+buffers between phases. Reference/video token count and H3 activation peaks are
+the main risks; they must be confirmed with real logs before accepting the plan.
 
 ## Cache Management List
 
