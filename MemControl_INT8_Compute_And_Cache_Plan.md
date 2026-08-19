@@ -79,6 +79,33 @@ all stage temporaries. Each stage has different weight values, but the shape and
 size pattern is similar. Chunking replaces `S` with `C` for temporaries; weight
 pieces depend on the chosen granularity.
 
+## qwen H and MLP Detail
+
+H is the persistent hidden state and must stay in VRAM during a layer because
+it is used by norm and residual paths. The 6-step table below lists step
+intermediates separately from H. At 55k tokens H is about 0.55GB.
+
+| Step | dequant VRAM weight | step intermediate (excluding H) |
+|---|---|---|
+| norm | ~0 | 0.55GB |
+| attention | 0.2-0.3GB | 1.5-2.5GB |
+| residual | 0 | 0.55GB |
+| norm | ~0 | 0.55GB |
+| MLP | 1.3-1.5GB | 2.8-5.6GB |
+| residual | 0 | 0.55GB |
+
+MLP sub-steps:
+
+| MLP sub-step | dequant VRAM weight | intermediate |
+|---|---|---|
+| gate | 0.4-0.5GB | 2.8GB |
+| up | 0.4-0.5GB | 2.8GB |
+| product | 0 | 2.8GB |
+| down | 0.4-0.5GB | input 2.8GB + output 0.55GB |
+
+If gate/up are evaluated with both alive, peak is about 5.6GB for the MLP
+intermediate. Chunking or fusing reduces that to the chunk size.
+
 ## Dynamic Async Policy
 
 Async buffer size is not fixed at one full layer. It should be sized to the next
