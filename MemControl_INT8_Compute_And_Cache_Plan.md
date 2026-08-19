@@ -1,8 +1,9 @@
-# INT8 Full Compute Plan
+# MemControl INT8 Compute and Cache Plan
 
 Goal: analyze whether qwen/H3 can run with int8 compute instead of the current
 "int8 storage -> bf16 dequant -> bf16 matmul" path, without modifying ComfyUI
-files if possible.
+files if possible. Quantized weights stay in RAM; runtime caches/activations
+use VRAM; qwen/H3 run one layer/block at a time with chunked compute.
 
 ## Current Compute Flow
 
@@ -71,6 +72,39 @@ Conclusion:
    a tolerance; do not accept silent quality regression.
 5. If native Comfy cannot do this safely, implement it in a separate custom node
    owned by MemControl.
+
+## VRAM Peak Estimate
+
+Assumptions:
+
+- Quantized weights live in RAM, not VRAM.
+- Only one qwen layer or one H3 block is active at a time.
+- Runtime cast buffers/caches live in VRAM and are cleared by MemControl at phase boundaries.
+- Attention/MLP use chunking where supported.
+- 8GB card, about 7.6-7.7GB usable after driver/other overhead.
+
+| Component | Estimated peak |
+|---|---|
+| Comfy/VAE/base runtime | 1.0-1.6 GB |
+| qwen current int8 weight in VRAM | 0.9 GB (if int8 linear) |
+| qwen dequant bf16 fallback weight | 1.9 GB (if fallback needed) |
+| qwen text-only activations | 0.5-1.5 GB |
+| qwen with reference/video tokens | 1-4 GB, depends on token count |
+| H3 one current block | 0.7 GB |
+| H3 chunked attention/MLP activations | 1-4 GB |
+| VAE decode | 0.5-2 GB |
+
+Realistic peak for the intended plan:
+
+```text
+base 1.6 + qwen int8 weight 0.9 + qwen activations 1.5 + bounded cast buffers 1-2
+= about 5-6 GB
+```
+
+That fits an 8GB card if caches are cleared and only one model phase is active.
+The previous OOM came from whole-layer `block.to(cuda)` plus unmanaged cast
+buffers, which are outside this plan. If reference/video token count is large,
+the estimate should be verified with actual logs before accepting the plan.
 
 ## Cache Management List
 
