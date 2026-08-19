@@ -87,8 +87,8 @@ Assumptions:
 Async loading is included: one cast buffer is roughly the size of the weight being
 transferred. qwen weight is about 0.9GB, so two async buffers are about 1.8GB.
 H3 block is about 0.7GB, so two async buffers are about 1.4GB. MemControl will
-force one stream or zero streams during managed phases and clear the buffers
-between phases, so the two-buffer worst case is not accepted as normal.
+keep the two streams for performance but clear the buffers between phases, so
+the two-buffer worst case is bounded and not allowed to persist.
 
 In the encoding node, qwen encoding runs first; VAE encode runs only when
 keyframes/references exist, after qwen has finished. They are sequential, not
@@ -114,6 +114,25 @@ Do not add all three phases together.
 The intended plan fits 8GB for text-only qwen and H3 if MemControl clears cast
 buffers between phases. Reference/video token count and H3 activation peaks are
 the main risks; they must be confirmed with real logs before accepting the plan.
+
+Reference token estimate for 1152x640:
+
+- One image/2-frame vision block: about 2880 tokens.
+- 9 reference images: about 26k tokens.
+- One 5s reference video is sampled at 2fps, about 5 vision blocks: about 14.4k tokens.
+- Two 5s reference videos: about 28.8k tokens.
+- Combined max: roughly 55k+ tokens.
+
+At 5120 hidden and 25600 MLP width, 55k tokens alone can require:
+
+- hidden/activation tensors: 0.5-1 GB
+- MLP intermediates: 2-4 GB
+- attention Q/K/V and related state: 2-4+ GB
+
+That exceeds 8GB before counting base runtime and cast buffers. MemControl
+cannot fix activation explosion caused by too many reference tokens. If max
+references are required, qwen attention/MLP chunking or lower reference token
+counts are needed.
 
 ## Cache Management List
 
